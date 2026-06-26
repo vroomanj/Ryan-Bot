@@ -1,14 +1,27 @@
 import os
 import time
+import logging
 from datetime import datetime, time as dt_time
 from zoneinfo import ZoneInfo
 import re
 import urllib.parse
+import random
 from dotenv import load_dotenv
 import discord
 from discord.ext import tasks
 from openai import AsyncOpenAI
 import aiohttp
+import db
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+    handlers=[
+        logging.FileHandler("ryanbot.log"),
+        logging.StreamHandler()
+    ]
+)
 
 # Load environment variables
 load_dotenv()
@@ -28,7 +41,7 @@ try:
     with open('SYSTEM_PROMPT.md', 'r', encoding='utf-8') as f:
         SYSTEM_PROMPT = f.read().strip()
 except FileNotFoundError:
-    print("Warning: SYSTEM_PROMPT.md not found. Falling back to default prompt.")
+    logging.warning("SYSTEM_PROMPT.md not found. Falling back to default prompt.")
     SYSTEM_PROMPT = "You are a helpful assistant."
 
 try:
@@ -36,7 +49,7 @@ try:
         FAVORITE_GAMES = f.read().strip()
         SYSTEM_PROMPT += f"\n\nHere is a list of your favorite slot games and their providers. If someone asks what they should play, pick one or two of these and aggressively hype them up:\n{FAVORITE_GAMES}"
 except FileNotFoundError:
-    print("Warning: FAVORITE_GAMES.md not found. Proceeding without it.")
+    logging.warning("FAVORITE_GAMES.md not found. Proceeding without it.")
 
 GIPHY_API_KEY = os.getenv('GIPHY_API_KEY')
 gif_api_calls = []
@@ -60,27 +73,37 @@ def can_make_gif_call():
     return True
 
 async def process_gifs_in_reply(text):
-    gif_match = re.search(r'\[GIF:\s*(.+?)\]', text, re.IGNORECASE)
-    if not gif_match:
-        return text, None
+    gif_url = None
+    local_gif_path = None
     
-    text = text.replace(gif_match.group(0), "").strip()
-    if not can_make_gif_call():
-        return text, None
+    # Check for local media trigger (handles LLMs outputting either LOCAL_MEDIA or LOCAL_GIF, multiple times, and optional markdown code blocks)
+    def replace_local_media(match):
+        nonlocal local_gif_path
+        filename = match.group(1).strip().lower()
+        if 'yell-ryan' in filename:
+            local_gif_path = '/home/vroomanj/Ryan-Bot/yell-ryan.gif'
+        return " "
         
-    query = gif_match.group(1)
-    gif_api_calls.append(time.time())
-    url = f"https://api.giphy.com/v1/gifs/random?api_key={GIPHY_API_KEY}&tag={urllib.parse.quote(query)}&rating=r"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    gif_url = data.get('data', {}).get('images', {}).get('original', {}).get('url')
-                    return text, gif_url
-    except Exception as e:
-        print(f"Error fetching GIF: {e}")
-    return text, None
+    text = re.sub(r'[\`\s]*\[LOCAL_(?:MEDIA|GIF):\s*(.+?)\][\`\s]*', replace_local_media, text, flags=re.IGNORECASE)
+
+    gif_match = re.search(r'[\`\s]*\[GIF:\s*(.+?)\][\`\s]*', text, re.IGNORECASE)
+    if gif_match and not local_gif_path:
+        text = text.replace(gif_match.group(0), "").strip()
+        if can_make_gif_call():
+            query = gif_match.group(1)
+            global gif_api_calls
+            gif_api_calls.append(time.time())
+            url = f"https://api.giphy.com/v1/gifs/random?api_key={GIPHY_API_KEY}&tag={urllib.parse.quote(query)}&rating=r"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            gif_url = data.get('data', {}).get('images', {}).get('original', {}).get('url')
+            except Exception as e:
+                logging.error(f"Error fetching GIF: {e}")
+                
+    return text.strip(), gif_url, local_gif_path
 
 def get_system_prompt(guild=None, channel=None, user=None):
     current_time_str = datetime.now(ZoneInfo('America/New_York')).strftime('%A, %B %d, %Y at %I:%M %p EST')
@@ -111,20 +134,7 @@ llm_client = AsyncOpenAI(
     api_key=os.getenv("OPENROUTER_API_KEY"),
 )
 
-# Conversation history storage
-# Format: {channel_id: [{"timestamp": float, "role": "user"|"assistant", "content": str}, ...]}
-conversation_history = {}
-CONTEXT_WINDOW_SECONDS = 3600  # 1 hour
-
-def prune_history(channel_id):
-    """Remove messages older than CONTEXT_WINDOW_SECONDS"""
-    if channel_id not in conversation_history:
-        return
-    current_time = time.time()
-    conversation_history[channel_id] = [
-        msg for msg in conversation_history[channel_id] 
-        if current_time - msg["timestamp"] < CONTEXT_WINDOW_SECONDS
-    ]
+# CONTEXT_WINDOW_SECONDS is handled by db.prune_conversation_history which defaults to 14400 (4 hours)
 
 def format_channel_links(text, guild):
     """Replaces #channel-name with clickable <#CHANNEL_ID> links."""
@@ -166,11 +176,67 @@ def split_message(text, limit=2000):
 
 @client.event
 async def on_ready():
-    print(f'Logged in as {client.user}')
+    logging.info(f'Logged in as {client.user}')
+    db.init_db()
     if not chat_reviver.is_running():
         chat_reviver.start()
     if not stream_reminder.is_running():
         stream_reminder.start()
+    if not random_engagement.is_running():
+        random_engagement.start()
+
+@tasks.loop(minutes=45)
+async def random_engagement():
+    if not client.is_ready() or random_engagement.current_loop == 0:
+        return
+        
+    db.garbage_collect_user_activity(hours=24)
+    active_users = db.get_active_users(minutes=30)
+    
+    if not active_users:
+        return
+        
+    # Pick a random user
+    target_user_id = random.choice(active_users)
+    recent_messages_list = db.get_user_recent_messages(target_user_id)
+    
+    # If they haven't typed any text (e.g. only sent images), skip
+    if not recent_messages_list:
+        return
+        
+    recent_messages = "\n".join(f"- {msg}" for msg in recent_messages_list)
+    
+    for guild in client.guilds:
+        channel = discord.utils.find(lambda c: "general" in c.name.lower(), guild.text_channels)
+        if channel:
+            prompt = f"You are starting a random conversation with a user out of nowhere. Their exact ping is <@{target_user_id}>. Here are the last few things they talked about recently:\n{recent_messages}\n\nPick one of these topics, tag them, and make a sarcastic/hyped comment to start a conversation in your Ryan Bot persona. Keep it short!"
+            
+            messages_for_api = [
+                {"role": "system", "content": get_system_prompt(guild=guild, channel=channel)},
+                {"role": "user", "content": prompt}
+            ]
+            
+            try:
+                response = await llm_client.chat.completions.create(
+                    model=MODEL_NAME, 
+                    messages=messages_for_api,
+                    extra_body={"provider": {"order": PROVIDER_ORDER}}
+                )
+                bot_reply = response.choices[0].message.content
+                bot_reply, gif_url, local_gif_path = await process_gifs_in_reply(bot_reply)
+                
+                bot_reply = format_channel_links(bot_reply, guild)
+                chunks = split_message(bot_reply)
+                for i, chunk in enumerate(chunks):
+                    await channel.send(chunk)
+                    
+                if gif_url:
+                    await channel.send(gif_url)
+                if local_gif_path:
+                    await channel.send(file=discord.File(local_gif_path))
+            except Exception as e:
+                logging.error(f"Error in random_engagement: {e}")
+            break # Only do this in one guild (the main one)
 
 stream_time = dt_time(hour=7, minute=55, tzinfo=ZoneInfo('America/New_York'))
 
@@ -198,7 +264,7 @@ async def stream_reminder():
                     extra_body={"provider": {"order": PROVIDER_ORDER}}
                 )
                 bot_reply = response.choices[0].message.content
-                bot_reply, gif_url = await process_gifs_in_reply(bot_reply)
+                bot_reply, gif_url, local_gif_path = await process_gifs_in_reply(bot_reply)
                 
                 # Format channel links if there are any
                 bot_reply = format_channel_links(bot_reply, guild)
@@ -212,8 +278,10 @@ async def stream_reminder():
                     
                 if gif_url:
                     await channel.send(gif_url)
+                if local_gif_path:
+                    await channel.send(file=discord.File(local_gif_path))
             except Exception as e:
-                print(f"Error in stream_reminder: {e}")
+                logging.error(f"Error in stream_reminder: {e}")
 
 @stream_reminder.before_loop
 async def before_stream_reminder():
@@ -263,24 +331,27 @@ async def chat_reviver():
                         extra_body={"provider": {"order": PROVIDER_ORDER}}
                     )
                     bot_reply = response.choices[0].message.content
-                    bot_reply, gif_url = await process_gifs_in_reply(bot_reply)
+                    bot_reply, gif_url, local_gif_path = await process_gifs_in_reply(bot_reply)
+                    
                     bot_reply = format_channel_links(bot_reply, guild)
                     
                     chunks = split_message(bot_reply)
                     for i, chunk in enumerate(chunks):
-                        await channel.send(chunk)
-                    
+                        await target_channel.send(chunk)
+                        
                     if gif_url:
-                        await channel.send(gif_url)
+                        await target_channel.send(gif_url)
+                    if local_gif_path:
+                        await target_channel.send(file=discord.File(local_gif_path))
         except Exception as e:
-            print(f"Error in chat_reviver: {e}")
+            logging.error(f"Error in chat_reviver: {e}")
 
 @client.event
 async def on_member_join(member):
     # Find the #general channel (fuzzy match to handle emojis)
     channel = discord.utils.find(lambda c: "general" in c.name.lower(), member.guild.text_channels)
     if not channel:
-        print(f"Could not find a 'general' channel for welcoming {member.display_name}")
+        logging.warning(f"Could not find a 'general' channel for welcoming {member.display_name}")
         return
         
     # Calculate account age
@@ -316,25 +387,34 @@ async def on_member_join(member):
             extra_body={"provider": {"order": PROVIDER_ORDER}}
         )
         bot_reply = response.choices[0].message.content
-        bot_reply, gif_url = await process_gifs_in_reply(bot_reply)
+        bot_reply, gif_url, local_gif_path = await process_gifs_in_reply(bot_reply)
         
         # Format channel links if there are any
         bot_reply = format_channel_links(bot_reply, member.guild)
         
         chunks = split_message(bot_reply)
-        for i, chunk in enumerate(chunks):
+        for chunk in chunks:
             await channel.send(chunk)
             
         if gif_url:
             await channel.send(gif_url)
+        if local_gif_path:
+            await channel.send(file=discord.File(local_gif_path))
     except Exception as e:
-        print(f"Error welcoming new member: {e}")
+        logging.error(f"Error welcoming new member: {e}")
 
 @client.event
 async def on_message(message):
     # Ignore messages from the bot itself
     if message.author == client.user:
         return
+
+    # Track user activity in SQLite DB
+    user_id = message.author.id
+    # Only track actual text messages that aren't bot commands
+    if message.content and not message.content.startswith('!'):
+        channel_name = message.channel.name if hasattr(message.channel, 'name') else "unknown"
+        db.log_user_activity(user_id, channel_name, message.content)
 
     # 1. Check for a static image attachment
     has_static_image = False
@@ -357,32 +437,52 @@ async def on_message(message):
     channel_id = message.channel.id
     
     # Prune old history for this channel
-    prune_history(channel_id)
-    
-    # Initialize history for this channel if it doesn't exist
-    if channel_id not in conversation_history:
-        conversation_history[channel_id] = []
+    db.prune_conversation_history(channel_id)
 
     # Remove the bot mention from the user's message
     user_content = message.content.replace(f'<@{client.user.id}>', '').replace(f'<@!{client.user.id}>', '').strip()
+    
+    # If they are replying to a message, trace the reply chain up to 3 messages back
+    if message.reference and message.reference.message_id:
+        try:
+            chain = []
+            current_ref = message.reference
+            depth = 0
+            
+            while current_ref and current_ref.message_id and depth < 3:
+                fetched_msg = await message.channel.fetch_message(current_ref.message_id)
+                chain.insert(0, f"[{fetched_msg.author.display_name}]: {fetched_msg.content}")
+                current_ref = fetched_msg.reference
+                depth += 1
+                
+            if chain:
+                chain_text = "\n".join(chain)
+                quote_text = f"The user is replying to this conversation chain:\n{chain_text}\n\nTheir reply: "
+                user_content = f"{quote_text}{user_content}"
+        except Exception as e:
+            logging.warning(f"Could not fetch referenced message chain: {e}")
     
     # If the user just tagged the bot (or posted an image) with no message
     if not user_content:
         user_content = "Hi"
 
     # Add user's message to history (text only for context window)
-    conversation_history[channel_id].append({
-        "timestamp": time.time(),
-        "role": "user",
-        "content": user_content
-    })
+    db.add_conversation_message(channel_id, "user", user_content)
 
     messages_for_api = [{"role": "system", "content": get_system_prompt(guild=message.guild, channel=message.channel, user=message.author)}]
-    for msg in conversation_history[channel_id]:
-        messages_for_api.append({
-            "role": msg["role"],
-            "content": msg["content"]
-        })
+    
+    # Load history from DB
+    history = db.get_conversation_history(channel_id)
+    messages_for_api.extend(history)
+    
+    # If the bot was explicitly pinged, insert the user's recent messages as context before their current ping
+    if is_mentioned:
+        recent_messages_list = db.get_user_recent_messages(message.author.id)
+        if len(recent_messages_list) > 1:
+            # Use :-1 to exclude the message they just sent right now
+            recent_context = "\n".join(f"- {msg}" for msg in recent_messages_list[:-1])
+            context_prompt = f"For extra context, the user tagging you recently said the following things across the server:\n{recent_context}\n\nYou can casually reference this if it seems relevant to their current message, but ignore it if it's completely unrelated."
+            messages_for_api.insert(-1, {"role": "system", "content": context_prompt})
 
     api_model = MODEL_NAME
     
@@ -419,18 +519,14 @@ async def on_message(message):
                 }
             )
             bot_reply = response.choices[0].message.content
-            bot_reply, gif_url = await process_gifs_in_reply(bot_reply)
+            bot_reply, gif_url, local_gif_path = await process_gifs_in_reply(bot_reply)
 
             # Format channel links
             if message.guild:
                 bot_reply = format_channel_links(bot_reply, message.guild)
 
             # Add bot's reply to history
-            conversation_history[channel_id].append({
-                "timestamp": time.time(),
-                "role": "assistant",
-                "content": bot_reply
-            })
+            db.add_conversation_message(channel_id, "assistant", bot_reply)
 
             # Split and send the reply
             reply_chunks = split_message(bot_reply)
@@ -442,13 +538,15 @@ async def on_message(message):
                     
             if gif_url:
                 await message.channel.send(gif_url)
+            if local_gif_path:
+                await message.channel.send(file=discord.File(local_gif_path))
                 
         except Exception as e:
-            print(f"Error calling OpenRouter: {e}")
+            logging.error(f"Error calling OpenRouter: {e}")
             await message.reply(f"Sorry, I had an issue connecting to my brain! Please check your OpenRouter API key and connection.")
 
 if __name__ == '__main__':
     if not TOKEN or TOKEN == 'your_discord_bot_token_here':
-        print("Please update the .env file with your Discord bot token.")
+        logging.error("Please update the .env file with your Discord bot token.")
     else:
         client.run(TOKEN)

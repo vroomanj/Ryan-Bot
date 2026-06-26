@@ -39,3 +39,7 @@ Thumbs.db
 # IDEs
 .vscode/
 .idea/
+
+# Bot Files
+ryanbot.db
+ryanbot.log
