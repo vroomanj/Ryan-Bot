@@ -1,5 +1,7 @@
 import sqlite3
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 DB_FILE = 'ryanbot.db'
 
@@ -22,6 +24,15 @@ def init_db():
             channel_name TEXT,
             content TEXT,
             timestamp REAL
+        )
+    ''')
+    
+    # User Profiles Table (Long-term memory)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id TEXT PRIMARY KEY,
+            summary TEXT,
+            last_updated REAL
         )
     ''')
     
@@ -68,14 +79,14 @@ def log_user_activity(user_id, channel_name, content):
     c.execute('INSERT INTO user_activity (user_id, channel_name, content, timestamp) VALUES (?, ?, ?, ?)',
               (str(user_id), str(channel_name), content, time.time()))
     
-    # Keep only the last 10 messages for this user
+    # Keep up to the last 100 messages for this user (for better profiling)
     c.execute('''
         DELETE FROM user_activity 
         WHERE user_id = ? AND rowid NOT IN (
             SELECT rowid FROM user_activity 
             WHERE user_id = ? 
             ORDER BY timestamp DESC 
-            LIMIT 10
+            LIMIT 100
         )
     ''', (str(user_id), str(user_id)))
     conn.commit()
@@ -90,18 +101,26 @@ def get_active_users(minutes=30):
     conn.close()
     return [r[0] for r in rows]
 
-def get_user_recent_messages(user_id):
+def get_user_recent_messages(user_id, limit=10):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('SELECT channel_name, content FROM user_activity WHERE user_id = ? ORDER BY timestamp ASC', (str(user_id),))
+    # Fetch up to 'limit' messages, ordered by timestamp descending, then reverse so they are chronological
+    c.execute('''
+        SELECT channel_name, content, timestamp 
+        FROM user_activity 
+        WHERE user_id = ? 
+        ORDER BY timestamp DESC 
+        LIMIT ?
+    ''', (str(user_id), limit))
     rows = c.fetchall()
     conn.close()
     
     messages = []
-    for r in rows:
+    for r in reversed(rows):
         channel = r[0] if r[0] else "unknown"
         content = r[1]
-        messages.append(f"(In #{channel}): {content}")
+        dt = datetime.fromtimestamp(r[2], tz=ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
+        messages.append(f"[{dt}] (In #{channel}): {content}")
         
     return messages
 
@@ -112,3 +131,38 @@ def garbage_collect_user_activity(hours=24):
     c.execute('DELETE FROM user_activity WHERE timestamp < ?', (cutoff,))
     conn.commit()
     conn.close()
+
+def get_user_profile(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT summary FROM user_profiles WHERE user_id = ?', (str(user_id),))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def update_user_profile(user_id, summary):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO user_profiles (user_id, summary, last_updated)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET summary = excluded.summary, last_updated = excluded.last_updated
+    ''', (str(user_id), summary, time.time()))
+    conn.commit()
+    conn.close()
+    
+def get_users_needing_profile_update(limit=5):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    cutoff = time.time() - (24 * 3600) # 24 hours
+    # Find users with recent activity (last 24 hours) who either have no profile, or an outdated profile
+    c.execute('''
+        SELECT DISTINCT a.user_id 
+        FROM user_activity a
+        LEFT JOIN user_profiles p ON a.user_id = p.user_id
+        WHERE a.timestamp >= ? AND (p.last_updated IS NULL OR p.last_updated < ?)
+        LIMIT ?
+    ''', (cutoff, cutoff, limit))
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]

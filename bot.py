@@ -12,6 +12,7 @@ from discord.ext import tasks
 from openai import AsyncOpenAI
 import aiohttp
 import db
+import discord.ui
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +34,10 @@ intents.message_content = True
 intents.members = True
 intents.presences = True
 client = discord.Client(intents=intents)
+tree = discord.app_commands.CommandTree(client)
+
+vibe_group = discord.app_commands.Group(name="vibe", description="Vibe related commands", default_permissions=discord.Permissions(manage_messages=True))
+tree.add_command(vibe_group)
 
 # Persona configuration
 MODEL_NAME = 'deepseek/deepseek-v4-flash'
@@ -116,11 +121,18 @@ def get_system_prompt(guild=None, channel=None, user=None):
         
     if channel:
         prompt += f" You are currently talking in the #{channel.name} channel."
+        if hasattr(channel, 'topic') and channel.topic:
+            prompt += f" The topic/purpose of this channel is: '{channel.topic}'."
         
     if user and hasattr(user, 'roles'):
         role_names = [role.name for role in user.roles if role.name != "@everyone"]
         roles_str = ", ".join(role_names) if role_names else "No special roles"
         prompt += f" You are replying to user: {user.display_name} (Their exact ping is <@{user.id}>, Roles: {roles_str}). If you want to ping them inline, use their exact ping string."
+        
+        # Inject long-term profile memory
+        profile = db.get_user_profile(user.id)
+        if profile:
+            prompt += f"\n\n[Long-Term Memory: Here is what you know about {user.display_name} from past interactions: {profile}]"
         
     if can_make_gif_call():
         prompt += " You have the ability to post a GIF by typing exactly `[GIF: search terms]`. However, you must EXTREMELY rarely do this. ONLY use a GIF if a user explicitly asks for one, or if you are reacting to a completely massive jackpot win. Under normal conversational circumstances, NEVER use a GIF."
@@ -143,6 +155,11 @@ def format_channel_links(text, guild):
         
     def replace_channel(match):
         channel_name = match.group(1).lower().replace("_", "-")
+        
+        # Don't try to link numbers like #1, #2 (these are rules or rankings)
+        if channel_name.isdigit():
+            return match.group(0)
+            
         # Substring match to handle emojis or slightly different names in Discord
         channel = discord.utils.find(lambda c: channel_name in c.name.lower().replace("_", "-"), guild.channels)
         
@@ -176,7 +193,15 @@ def split_message(text, limit=2000):
 
 @client.event
 async def on_ready():
-    logging.info(f'Logged in as {client.user}')
+    logging.info(f"Logged in as {client.user}")
+    
+    # Sync slash commands
+    try:
+        await tree.sync()
+        logging.info("Slash commands synced successfully.")
+    except Exception as e:
+        logging.error(f"Failed to sync slash commands: {e}")
+        
     db.init_db()
     if not chat_reviver.is_running():
         chat_reviver.start()
@@ -184,6 +209,78 @@ async def on_ready():
         stream_reminder.start()
     if not random_engagement.is_running():
         random_engagement.start()
+    if not profile_updater.is_running():
+        profile_updater.start()
+    if not status_changer.is_running():
+        status_changer.start()
+
+class LookupPaginationView(discord.ui.View):
+    def __init__(self, embeds):
+        super().__init__(timeout=300)
+        self.embeds = embeds
+        self.current_page = 0
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = self.current_page == 0
+        self.next_button.disabled = self.current_page == len(self.embeds) - 1
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.primary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page -= 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
+
+@vibe_group.command(name="check", description="[Moderator Only] Look up a user's long-term bot profile and recent vibe.")
+async def vibe_check(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    
+    embeds = []
+    profile = db.get_user_profile(user.id)
+    
+    # Page 1: Vibe Profile
+    embed1 = discord.Embed(
+        title=f"🧠 Vibe Profile: {user.display_name}",
+        description=profile if profile else "No AI profile generated yet.",
+        color=discord.Color.blue()
+    )
+    embed1.set_thumbnail(url=user.display_avatar.url if user.display_avatar else None)
+    
+    roles_str = ", ".join([r.name for r in user.roles if r.name != "@everyone"])
+    embed1.add_field(name="User ID", value=str(user.id), inline=True)
+    embed1.add_field(name="Joined Server", value=user.joined_at.strftime("%Y-%m-%d") if user.joined_at else "Unknown", inline=True)
+    embed1.add_field(name="Roles", value=roles_str if roles_str else "None", inline=False)
+    
+    embed1.set_footer(text="Page 1 of 2 • Vibe Profile")
+    embeds.append(embed1)
+    
+    # Page 2: Recent Chat History
+    recent_messages = db.get_user_recent_messages(user.id, limit=5)
+    embed2 = discord.Embed(
+        title=f"📝 Recent Activity: {user.display_name}",
+        color=discord.Color.green()
+    )
+    embed2.set_thumbnail(url=user.display_avatar.url if user.display_avatar else None)
+    
+    if recent_messages:
+        recent_text = "\n".join(recent_messages)
+        if len(recent_text) > 4000:
+            recent_text = recent_text[:4000] + "..."
+        embed2.add_field(name="Last 5 Messages", value=recent_text, inline=False)
+    else:
+        embed2.description = "No recent messages found in database."
+        
+    embed2.set_footer(text="Page 2 of 2 • Message History")
+    embeds.append(embed2)
+    
+    view = LookupPaginationView(embeds)
+    await interaction.followup.send(embed=embeds[0], view=view)
 
 @tasks.loop(minutes=45)
 async def random_engagement():
@@ -209,7 +306,17 @@ async def random_engagement():
     for guild in client.guilds:
         channel = discord.utils.find(lambda c: "general" in c.name.lower(), guild.text_channels)
         if channel:
-            prompt = f"You are starting a random conversation with a user out of nowhere. Their exact ping is <@{target_user_id}>. Here are the last few things they talked about recently:\n{recent_messages}\n\nPick one of these topics, tag them, and make a sarcastic/hyped comment to start a conversation in your Ryan Bot persona. Keep it short!"
+            recent_chat = []
+            try:
+                async for msg in channel.history(limit=15):
+                    dt = msg.created_at.astimezone(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
+                    recent_chat.insert(0, f"[{dt}] [{msg.author.display_name}]: {msg.content}")
+            except Exception:
+                pass
+                
+            group_context = "\n".join(recent_chat) if recent_chat else "No recent messages."
+            
+            prompt = f"You are starting a random conversation with a user out of nowhere. Their exact ping is <@{target_user_id}>. Here are the last few things they talked about recently:\n{recent_messages}\n\nAnd here is the recent conversation happening in the channel right now:\n{group_context}\n\nPick one of these topics, tag them, and make a sarcastic/hyped comment to start a conversation in your Ryan Bot persona. Keep it short!"
             
             messages_for_api = [
                 {"role": "system", "content": get_system_prompt(guild=guild, channel=channel)},
@@ -270,7 +377,7 @@ async def stream_reminder():
                 bot_reply = format_channel_links(bot_reply, guild)
                 
                 # Add @here ping
-                bot_reply = f"@here\n\n{bot_reply}"
+                bot_reply = f"{bot_reply} @here"
                 
                 chunks = split_message(bot_reply)
                 for i, chunk in enumerate(chunks):
@@ -286,6 +393,84 @@ async def stream_reminder():
 @stream_reminder.before_loop
 async def before_stream_reminder():
     await client.wait_until_ready()
+
+@tasks.loop(minutes=30)
+async def profile_updater():
+    if not client.is_ready():
+        return
+        
+    users_to_update = db.get_users_needing_profile_update(limit=5)
+    for user_id in users_to_update:
+        recent_messages = db.get_user_recent_messages(user_id, limit=100)
+        if not recent_messages:
+            continue
+            
+        current_profile = db.get_user_profile(user_id)
+        
+        # Try to fetch their Discord profile and roles
+        member = None
+        for guild in client.guilds:
+            member = guild.get_member(int(user_id))
+            if member:
+                break
+                
+        user_info = f"User ID: {user_id}"
+        if member:
+            role_names = [role.name for role in member.roles if role.name != "@everyone"]
+            roles_str = ", ".join(role_names) if role_names else "No special roles"
+            user_info = f"Display Name: {member.display_name} | Roles: {roles_str}"
+        
+        recent_text = "\n".join(recent_messages)
+        prompt = f"Here are the recent messages sent by this user ({user_info}):\n{recent_text}\n\n"
+        if current_profile:
+            prompt += f"Here is their current profile summary:\n{current_profile}\n\nUpdate their profile summary to incorporate any new vibe, favorite games, win/loss streaks, or behavioral quirks you notice. Keep it to one concise paragraph."
+        else:
+            prompt += "Write a short, one-paragraph profile summary for this user documenting their general vibe, favorite games, or behavioral quirks based on these messages."
+            
+        try:
+            response = await llm_client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "You are a backend profiling agent. Your output will be saved directly to a database as a user profile. Write ONLY the profile paragraph. Do not include greetings or markdown blocks."},
+                    {"role": "user", "content": prompt}
+                ],
+                extra_body={"provider": {"order": PROVIDER_ORDER}}
+            )
+            new_profile = response.choices[0].message.content.strip()
+            db.update_user_profile(user_id, new_profile)
+        except Exception as e:
+            logging.error(f"Error updating profile for {user_id}: {e}")
+
+@tasks.loop(minutes=15)
+async def status_changer():
+    if not client.is_ready():
+        return
+        
+    statuses = [
+        discord.Activity(type=discord.ActivityType.watching, name="Ryan tilt on Plinko"),
+        discord.Activity(type=discord.ActivityType.playing, name="Gates of Olympus"),
+        discord.Activity(type=discord.ActivityType.watching, name="a 0x Hacksaw bonus"),
+        discord.Activity(type=discord.ActivityType.playing, name="with the server's database"),
+        discord.Activity(type=discord.ActivityType.listening, name="people beg for sweeps"),
+        discord.Activity(type=discord.ActivityType.playing, name="Blackjack against the dealer"),
+        discord.Activity(type=discord.ActivityType.watching, name="the crypto charts crash"),
+        discord.Activity(type=discord.ActivityType.playing, name="a $1,000 bonus buy"),
+        discord.CustomActivity(name="Currently down $5,000 SC"),
+        discord.Activity(type=discord.ActivityType.listening, name="slot machine noises"),
+        discord.Activity(type=discord.ActivityType.watching, name="the roulette wheel spin"),
+        discord.CustomActivity(name="Chasing the Grand Jackpot"),
+        discord.Activity(type=discord.ActivityType.listening, name="Ryan yell at the screen"),
+        discord.Activity(type=discord.ActivityType.playing, name="hide and seek with my balance"),
+        discord.CustomActivity(name="Banned from the live dealer tables"),
+        discord.Activity(type=discord.ActivityType.watching, name="my crypto wallet drain"),
+        discord.Activity(type=discord.ActivityType.playing, name="Sweet Bonanza on auto-spin"),
+        discord.Activity(type=discord.ActivityType.listening, name="the sweet sound of a max win"),
+        discord.CustomActivity(name="RTP is definitely a myth"),
+        discord.Activity(type=discord.ActivityType.watching, name="someone hit a 10,000x")
+    ]
+    
+    new_status = random.choice(statuses)
+    await client.change_presence(activity=new_status)
 
 @tasks.loop(minutes=5)
 async def chat_reviver():
@@ -337,12 +522,12 @@ async def chat_reviver():
                     
                     chunks = split_message(bot_reply)
                     for i, chunk in enumerate(chunks):
-                        await target_channel.send(chunk)
+                        await channel.send(chunk)
                         
                     if gif_url:
-                        await target_channel.send(gif_url)
+                        await channel.send(gif_url)
                     if local_gif_path:
-                        await target_channel.send(file=discord.File(local_gif_path))
+                        await channel.send(file=discord.File(local_gif_path))
         except Exception as e:
             logging.error(f"Error in chat_reviver: {e}")
 
@@ -451,7 +636,8 @@ async def on_message(message):
             
             while current_ref and current_ref.message_id and depth < 3:
                 fetched_msg = await message.channel.fetch_message(current_ref.message_id)
-                chain.insert(0, f"[{fetched_msg.author.display_name}]: {fetched_msg.content}")
+                dt = fetched_msg.created_at.astimezone(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
+                chain.insert(0, f"[{dt}] [{fetched_msg.author.display_name}]: {fetched_msg.content}")
                 current_ref = fetched_msg.reference
                 depth += 1
                 
@@ -475,14 +661,29 @@ async def on_message(message):
     history = db.get_conversation_history(channel_id)
     messages_for_api.extend(history)
     
-    # If the bot was explicitly pinged, insert the user's recent messages as context before their current ping
+    # If the bot was explicitly pinged, insert the user's recent messages and channel context before their current ping
     if is_mentioned:
+        # User's recent messages
         recent_messages_list = db.get_user_recent_messages(message.author.id)
         if len(recent_messages_list) > 1:
             # Use :-1 to exclude the message they just sent right now
             recent_context = "\n".join(f"- {msg}" for msg in recent_messages_list[:-1])
             context_prompt = f"For extra context, the user tagging you recently said the following things across the server:\n{recent_context}\n\nYou can casually reference this if it seems relevant to their current message, but ignore it if it's completely unrelated."
             messages_for_api.insert(-1, {"role": "system", "content": context_prompt})
+            
+        # Channel's recent messages (Reading the room)
+        recent_chat = []
+        try:
+            async for msg in message.channel.history(limit=15, before=message):
+                dt = msg.created_at.astimezone(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
+                recent_chat.insert(0, f"[{dt}] [{msg.author.display_name}]: {msg.content}")
+        except Exception as e:
+            logging.error(f"Error fetching channel history: {e}")
+            
+        if recent_chat:
+            group_context = "\n".join(recent_chat)
+            room_read_prompt = f"For extra context, here are the last few messages sent in this channel right before you were pinged. Use this to 'read the room' and understand what the group is currently discussing:\n{group_context}"
+            messages_for_api.insert(-1, {"role": "system", "content": room_read_prompt})
 
     api_model = MODEL_NAME
     
