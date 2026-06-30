@@ -36,6 +36,14 @@ def init_db():
         )
     ''')
     
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_notes (
+            user_id TEXT,
+            note TEXT,
+            added_at REAL
+        )
+    ''')
+    
     # Try to alter table to add channel_name if it was created before this update
     try:
         c.execute('ALTER TABLE user_activity ADD COLUMN channel_name TEXT')
@@ -139,6 +147,52 @@ def get_user_profile(user_id):
     row = c.fetchone()
     conn.close()
     return row[0] if row else None
+
+def get_user_notes(user_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT note FROM user_notes WHERE user_id = ? ORDER BY added_at ASC', (str(user_id),))
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def get_full_user_profile(user_id):
+    profile = get_user_profile(user_id)
+    notes = get_user_notes(user_id)
+    
+    if not profile and not notes:
+        return None
+        
+    full_text = profile if profile else "No AI profile exists yet."
+    if notes:
+        notes_str = "\n".join(f"• {note}" for note in notes)
+        full_text += f"\n\n🚨 **MODERATOR NOTES:**\n{notes_str}"
+        
+    return full_text
+
+def add_user_note(user_id, note):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('INSERT INTO user_notes (user_id, note, added_at) VALUES (?, ?, ?)',
+              (str(user_id), note, time.time()))
+    conn.commit()
+    conn.close()
+
+def delete_user_note(user_id, index):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('SELECT added_at FROM user_notes WHERE user_id = ? ORDER BY added_at ASC', (str(user_id),))
+    rows = c.fetchall()
+    
+    success = False
+    if 0 <= index < len(rows):
+        target_time = rows[index][0]
+        c.execute('DELETE FROM user_notes WHERE user_id = ? AND added_at = ?', (str(user_id), target_time))
+        conn.commit()
+        success = True
+        
+    conn.close()
+    return success
 
 def update_user_profile(user_id, summary):
     conn = sqlite3.connect(DB_FILE)

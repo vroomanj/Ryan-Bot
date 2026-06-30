@@ -110,9 +110,9 @@ async def process_gifs_in_reply(text):
                 
     return text.strip(), gif_url, local_gif_path
 
-def get_system_prompt(guild=None, channel=None, user=None):
-    current_time_str = datetime.now(ZoneInfo('America/New_York')).strftime('%A, %B %d, %Y at %I:%M %p EST')
-    prompt = f"{SYSTEM_PROMPT}\n\n[System Info: The current date and time is {current_time_str}. Always refer to time in EST."
+def get_system_prompt(guild=None, channel=None, user=None, mentioned_users=None):
+    current_time_str = datetime.now(ZoneInfo('America/New_York')).strftime('%A, %B %d, %Y at %I:%M %p %Z')
+    prompt = f"{SYSTEM_PROMPT}\n\n[System Info: The current date and time is {current_time_str}.]"
     
     if guild:
         total_members = guild.member_count
@@ -120,19 +120,30 @@ def get_system_prompt(guild=None, channel=None, user=None):
         prompt += f" The server has {total_members} members ({online_members} currently online)."
         
     if channel:
-        prompt += f" You are currently talking in the #{channel.name} channel."
+        if hasattr(channel, 'name'):
+            prompt += f" You are currently talking in the #{channel.name} channel."
+        else:
+            prompt += " You are currently talking in a direct message (DM)."
+            
         if hasattr(channel, 'topic') and channel.topic:
             prompt += f" The topic/purpose of this channel is: '{channel.topic}'."
         
-    if user and hasattr(user, 'roles'):
-        role_names = [role.name for role in user.roles if role.name != "@everyone"]
+    if user:
+        role_names = [role.name for role in user.roles if role.name != "@everyone"] if hasattr(user, 'roles') else []
         roles_str = ", ".join(role_names) if role_names else "No special roles"
         prompt += f" You are replying to user: {user.display_name} (Their exact ping is <@{user.id}>, Roles: {roles_str}). If you want to ping them inline, use their exact ping string."
         
         # Inject long-term profile memory
-        profile = db.get_user_profile(user.id)
+        profile = db.get_full_user_profile(user.id)
         if profile:
             prompt += f"\n\n[Long-Term Memory: Here is what you know about {user.display_name} from past interactions: {profile}]"
+            
+    if mentioned_users:
+        prompt += "\n\n[Context: The user mentioned other people in their message. Here are their profiles so you know who they are talking about:]"
+        for m_user in mentioned_users:
+            m_profile = db.get_full_user_profile(m_user.id)
+            if m_profile:
+                prompt += f"\n- {m_user.display_name}: {m_profile}"
         
     if can_make_gif_call():
         prompt += " You have the ability to post a GIF by typing exactly `[GIF: search terms]`. However, you must EXTREMELY rarely do this. ONLY use a GIF if a user explicitly asks for one, or if you are reacting to a completely massive jackpot win. Under normal conversational circumstances, NEVER use a GIF."
@@ -237,14 +248,33 @@ class LookupPaginationView(discord.ui.View):
         self.update_buttons()
         await interaction.response.edit_message(embed=self.embeds[self.current_page], view=self)
 
+class VibeEditModal(discord.ui.Modal, title="Edit Vibe Profile"):
+    def __init__(self, target_user_id: int, current_profile: str):
+        super().__init__()
+        self.target_user_id = target_user_id
+        
+        self.profile_input = discord.ui.TextInput(
+            label="Profile Summary",
+            style=discord.TextStyle.paragraph,
+            default=current_profile,
+            required=True,
+            max_length=2000
+        )
+        self.add_item(self.profile_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        new_profile = self.profile_input.value.strip()
+        db.update_user_profile(self.target_user_id, new_profile)
+        await interaction.response.send_message(f"✅ Vibe profile for User `{self.target_user_id}` has been successfully overwritten in the database!", ephemeral=True)
+
 @vibe_group.command(name="check", description="[Moderator Only] Look up a user's long-term bot profile and recent vibe.")
 async def vibe_check(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
     
     embeds = []
-    profile = db.get_user_profile(user.id)
     
     # Page 1: Vibe Profile
+    profile = db.get_full_user_profile(user.id)
     embed1 = discord.Embed(
         title=f"🧠 Vibe Profile: {user.display_name}",
         description=profile if profile else "No AI profile generated yet.",
@@ -282,6 +312,80 @@ async def vibe_check(interaction: discord.Interaction, user: discord.Member):
     view = LookupPaginationView(embeds)
     await interaction.followup.send(embed=embeds[0], view=view)
 
+@vibe_group.command(name="edit", description="[Moderator Only] Manually edit a user's vibe profile.")
+async def vibe_edit(interaction: discord.Interaction, user: discord.Member):
+    # Fetch existing profile
+    profile = db.get_user_profile(user.id)
+    if not profile:
+        profile = "No profile exists for this user yet. You can write one here!"
+        
+    # Send the modal popup
+    modal = VibeEditModal(target_user_id=user.id, current_profile=profile)
+    await interaction.response.send_modal(modal)
+
+@vibe_group.command(name="refresh", description="[Moderator Only] Force a manual refresh of a user's vibe profile via the AI.")
+async def vibe_refresh(interaction: discord.Interaction, user: discord.Member):
+    await interaction.response.defer(ephemeral=True)
+    
+    recent_messages = db.get_user_recent_messages(user.id, limit=100)
+    if not recent_messages:
+        await interaction.followup.send(f"❌ Cannot refresh profile. User {user.display_name} has no recent messages in the database.", ephemeral=True)
+        return
+        
+    current_profile = db.get_user_profile(user.id)
+    
+    role_names = [role.name for role in user.roles if role.name != "@everyone"]
+    roles_str = ", ".join(role_names) if role_names else "No special roles"
+    user_info = f"Display Name: {user.display_name} (Ping: <@{user.id}>) | Roles: {roles_str}"
+    
+    recent_text = "\n".join(recent_messages)
+    prompt = f"Here are the recent messages sent by this user ({user_info}):\n{recent_text}\n\n"
+    if current_profile:
+        prompt += f"Here is their current profile summary:\n{current_profile}\n\nUpdate their profile summary to incorporate any new vibe, favorite games, win/loss streaks, or behavioral quirks you notice. Keep it to one concise paragraph."
+    else:
+        prompt += "Write a short, one-paragraph profile summary for this user documenting their general vibe, favorite games, or behavioral quirks based on these messages."
+        
+    try:
+        response = await llm_client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": "You are a backend profiling agent. Your output will be saved directly to a database as a user profile. Write ONLY the profile paragraph. Do not include greetings or markdown blocks."},
+                {"role": "user", "content": prompt}
+            ],
+            extra_body={"provider": {"order": PROVIDER_ORDER}}
+        )
+        new_profile = response.choices[0].message.content.strip()
+        db.update_user_profile(user.id, new_profile)
+        await interaction.followup.send(f"✅ Successfully refreshed the AI profile for **{user.display_name}**!\n\n**New Profile:**\n{new_profile}", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Error manually refreshing profile for {user.id}: {e}")
+        await interaction.followup.send("❌ An error occurred while communicating with the AI to refresh the profile.", ephemeral=True)
+
+@vibe_group.command(name="add", description="[Moderator Only] Add a permanent, highly-prioritized note to a user's vibe profile.")
+@discord.app_commands.describe(note="The permanent note to attach to their profile.")
+async def vibe_add(interaction: discord.Interaction, user: discord.Member, note: str):
+    db.add_user_note(user.id, note.strip())
+    await interaction.response.send_message(f"✅ Successfully attached permanent note to **{user.display_name}**:\n`{note.strip()}`", ephemeral=True)
+
+@vibe_group.command(name="list", description="[Moderator Only] List all permanent notes for a user.")
+async def vibe_list(interaction: discord.Interaction, user: discord.Member):
+    notes = db.get_user_notes(user.id)
+    if not notes:
+        await interaction.response.send_message(f"User **{user.display_name}** has no permanent notes.", ephemeral=True)
+        return
+        
+    notes_str = "\n".join(f"**{i+1}.** {note}" for i, note in enumerate(notes))
+    await interaction.response.send_message(f"🚨 **Permanent Notes for {user.display_name}:**\n\n{notes_str}", ephemeral=True)
+
+@vibe_group.command(name="delete", description="[Moderator Only] Delete a permanent note from a user.")
+@discord.app_commands.describe(index="The note number to delete (use /vibe list to find the number).")
+async def vibe_delete(interaction: discord.Interaction, user: discord.Member, index: int):
+    success = db.delete_user_note(user.id, index - 1)
+    if success:
+        await interaction.response.send_message(f"✅ Successfully deleted note #{index} for **{user.display_name}**.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"❌ Could not find note #{index} for **{user.display_name}**. Use `/vibe list` to see valid note numbers.", ephemeral=True)
+
 @tasks.loop(minutes=45)
 async def random_engagement():
     if not client.is_ready() or random_engagement.current_loop == 0:
@@ -310,7 +414,7 @@ async def random_engagement():
             try:
                 async for msg in channel.history(limit=15):
                     dt = msg.created_at.astimezone(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
-                    recent_chat.insert(0, f"[{dt}] [{msg.author.display_name}]: {msg.content}")
+                    recent_chat.insert(0, f"[{dt}] [{msg.author.display_name} (<@{msg.author.id}>)]: {msg.content}")
             except Exception:
                 pass
                 
@@ -357,7 +461,7 @@ async def stream_reminder():
     for guild in client.guilds:
         channel = discord.utils.find(lambda c: "slots-with-ryan" in c.name.lower(), guild.text_channels)
         if channel:
-            prompt = "It is 7:55 AM EST! Announce to the chat that Ryan's stream is starting in 5 minutes! Make it extremely hyped, and explicitly tell them to go to MyPrize.us/BigJackpots to watch. Make sure you include the link directly in your message!"
+            prompt = "It is 7:55 AM Eastern Time! Announce to the chat that Ryan's stream is starting in 5 minutes! Make it extremely hyped, and explicitly tell them to go to https://MyPrize.us/BigJackpots to watch. Make sure you include the exact link `https://MyPrize.us/BigJackpots` directly in your message!"
             
             messages_for_api = [
                 {"role": "system", "content": get_system_prompt(guild=guild, channel=channel)},
@@ -418,7 +522,7 @@ async def profile_updater():
         if member:
             role_names = [role.name for role in member.roles if role.name != "@everyone"]
             roles_str = ", ".join(role_names) if role_names else "No special roles"
-            user_info = f"Display Name: {member.display_name} | Roles: {roles_str}"
+            user_info = f"Display Name: {member.display_name} (Ping: <@{user_id}>) | Roles: {roles_str}"
         
         recent_text = "\n".join(recent_messages)
         prompt = f"Here are the recent messages sent by this user ({user_info}):\n{recent_text}\n\n"
@@ -612,11 +716,12 @@ async def on_message(message):
                 image_url = att.url
                 break
 
-    # 2. Check if the bot should respond (mentioned OR static image in wins channel)
+    # 2. Check if the bot should respond (mentioned, static image in wins channel, or a DM)
+    is_dm = message.guild is None
     is_mentioned = client.user in message.mentions
-    is_wins_channel = "share-your-wins" in message.channel.name.lower()
+    is_wins_channel = hasattr(message.channel, 'name') and "share-your-wins" in message.channel.name.lower()
     
-    if not is_mentioned and not (is_wins_channel and has_static_image):
+    if not is_dm and not is_mentioned and not (is_wins_channel and has_static_image):
         return
 
     channel_id = message.channel.id
@@ -637,7 +742,7 @@ async def on_message(message):
             while current_ref and current_ref.message_id and depth < 3:
                 fetched_msg = await message.channel.fetch_message(current_ref.message_id)
                 dt = fetched_msg.created_at.astimezone(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
-                chain.insert(0, f"[{dt}] [{fetched_msg.author.display_name}]: {fetched_msg.content}")
+                chain.insert(0, f"[{dt}] [{fetched_msg.author.display_name} (<@{fetched_msg.author.id}>)]: {fetched_msg.content}")
                 current_ref = fetched_msg.reference
                 depth += 1
                 
@@ -653,16 +758,17 @@ async def on_message(message):
         user_content = "Hi"
 
     # Add user's message to history (text only for context window)
-    db.add_conversation_message(channel_id, "user", user_content)
+    db.add_conversation_message(channel_id, "user", f"[{message.author.display_name} (<@{message.author.id}>)]: {user_content}")
 
-    messages_for_api = [{"role": "system", "content": get_system_prompt(guild=message.guild, channel=message.channel, user=message.author)}]
+    other_mentions = [m for m in message.mentions if m.id != client.user.id]
+    messages_for_api = [{"role": "system", "content": get_system_prompt(guild=message.guild, channel=message.channel, user=message.author, mentioned_users=other_mentions)}]
     
     # Load history from DB
     history = db.get_conversation_history(channel_id)
     messages_for_api.extend(history)
     
-    # If the bot was explicitly pinged, insert the user's recent messages and channel context before their current ping
-    if is_mentioned:
+    # If the bot was explicitly pinged (or DM'd), insert the user's recent messages and channel context before their current ping
+    if is_mentioned or is_dm:
         # User's recent messages
         recent_messages_list = db.get_user_recent_messages(message.author.id)
         if len(recent_messages_list) > 1:
@@ -676,7 +782,7 @@ async def on_message(message):
         try:
             async for msg in message.channel.history(limit=15, before=message):
                 dt = msg.created_at.astimezone(ZoneInfo('America/New_York')).strftime('%Y-%m-%d %H:%M:%S')
-                recent_chat.insert(0, f"[{dt}] [{msg.author.display_name}]: {msg.content}")
+                recent_chat.insert(0, f"[{dt}] [{msg.author.display_name} (<@{msg.author.id}>)]: {msg.content}")
         except Exception as e:
             logging.error(f"Error fetching channel history: {e}")
             
